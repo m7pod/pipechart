@@ -1,0 +1,230 @@
+#!/bin/bash
+# piping — Network latency data generator for pipechart
+#
+# Pings multiple hosts in parallel and outputs periodic KEY=VALUE lines.
+# Designed to pipe straight into pipechart for live ASCII bar/sparkline charts.
+#
+# Usage:
+#   piping [OPTS] HOST...
+#   piping [OPTS] HOST... | pipechart -n 60 -c 1 -h 5     # one row per host
+#   piping [OPTS] HOST... | pipechart -n 80 -m spark       # sparklines
+#   piping -j HOST...     | pipechart -n 60 -c 1 -h 5     # with jitter
+#
+# Options:
+#   -j           Emit jitter metrics (absolute Δ from previous RTT)
+#   -l           Emit cumulative loss counter (grows with each lost packet)
+#   -L LABELS    Comma-separated custom labels (e.g. -L "Google,CF,Quad9")
+#   -w SEC       Ping deadline / per-host timeout (default: 1)
+#   -d MS        Delay between batches, in ms (default: 200)
+#   -h           Show this help (piping help)
+#
+# Pipechart flags you'll typically want:
+#   -c 1         One column (each host gets its own full-width row, 5 bars)
+#   -h 5         Bar height (5 rows per destination)
+#   -n 60        History points
+#   -c 2 -h 5    Two side-by-side (wide terminal, ~100+ cols)
+#
+# Examples:
+#   piping google.com cloudflare.com | ./pipechart -n 60 -c 1 -h 5
+#   piping -L "Google,CF" 8.8.8.8 1.1.1.1 | ./pipechart -n 60 -c 1 -h 5
+#   piping -j -w 2 google.com | ./pipechart -n 80 -m spark
+
+set -euo pipefail
+
+JITTER=false
+LOSS=false
+TIMEOUT=1
+DELAY_MS=200
+CUSTOM_LABELS=""
+
+# ── Help ──────────────────────────────────────────────────────
+usage() {
+    cat <<'EOF'
+piping — Network latency data generator for pipechart
+
+Usage:
+  piping [OPTS] HOST...
+  piping [OPTS] HOST... | pipechart -n 60 -c 1 -h 5
+
+  Each host gets its own full-width row with 5-line bar height.
+  Labels won't truncate; bar height stays at 5.
+
+Options:
+  -j           Emit jitter metrics (absolute Δ from previous RTT)
+  -l           Emit cumulative loss counter (running total of lost packets)
+  -L LABELS    Comma-separated custom labels (e.g. -L "Google,CF,Quad9")
+  -w SEC       Ping deadline / per-host timeout (default: 1)
+  -d MS        Delay between batches, in ms (default: 200)
+  -h           Show this help (piping help — for pipechart help see its README)
+
+Examples:
+  piping google.com cloudflare.com | ./pipechart -n 60 -c 1 -h 5
+  piping -L "Google,CF" 8.8.8.8 1.1.1.1 | ./pipechart -n 60 -c 1 -h 5
+  piping -j -l google.com cloudflare.com | ./pipechart -n 60 -c 1 -h 5
+  piping google.com cloudflare.com | ./pipechart -n 80 -m spark
+EOF
+    exit 0
+}
+
+# ── Parse args ─────────────────────────────────────────────────
+TARGETS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -j)          JITTER=true; shift ;;
+        -l)          LOSS=true; shift ;;
+        -L)          CUSTOM_LABELS="$2"; shift 2 ;;
+        -w)          TIMEOUT="$2"; shift 2 ;;
+        -d)          DELAY_MS="$2"; shift 2 ;;
+        -h|--help)   usage ;;
+        -*)          echo "Unknown option: $1" >&2; usage ;;
+        *)           TARGETS+=("$1"); shift ;;
+    esac
+done
+
+if [[ ${#TARGETS[@]} -eq 0 ]]; then
+    TARGETS=(8.8.8.8 1.1.1.1)
+    echo "piping: no targets, defaulting to ${TARGETS[*]}" >&2
+fi
+
+# ── Temp dir for inter-process state ───────────────────────────
+TMPD=$(mktemp -d)
+trap 'rm -rf "$TMPD"' EXIT
+
+# ── Parse custom labels into array ─────────────────────────────
+declare -a CLABELS=()
+if [[ -n "$CUSTOM_LABELS" ]]; then
+    IFS=',' read -ra CLABELS <<< "$CUSTOM_LABELS"
+    if [[ ${#CLABELS[@]} -ne ${#TARGETS[@]} ]]; then
+        echo "WARNING: ${#CLABELS[@]} labels for ${#TARGETS[@]} hosts — using defaults for extras" >&2
+    fi
+fi
+
+# ── Smart label: short, descriptive, fits pipechart ────────────
+#   google.com        → google
+#   one.one.one.one   → one
+#   8.8.8.8           → 8_8_8_8   (IPs stay as-is, dots → _)
+#   custom via -L      → exact string
+_get_label() {
+    local idx="$1" host="$2"
+    # Use custom label if available for this index
+    if [[ -n "${CLABELS[$idx]:-}" ]]; then
+        echo "${CLABELS[$idx]}"
+        return
+    fi
+    # Is it an IP? (all segments are numeric)
+    if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "${host//./_}"
+        return
+    fi
+    # Hostname: take the first label (before the first dot)
+    local short="${host%%.*}"
+    # Cap at 10 chars for pipechart; strip unsafe chars
+    short="${short:0:10}"
+    echo "$short" | sed 's/[^a-zA-Z0-9_-]/_/g'
+}
+
+# ── Short label helper: truncate base to fit suffix within 10 chars ──
+#    pipechart caps labels at 10; "google_loss" (11) becomes "google_lo…"
+#    → "google_L" (8) fits perfectly.
+_short_label() {
+    local base="$1" suffix="$2"
+    local max_base=$(( 10 - ${#suffix} ))
+    if [[ ${#base} -gt $max_base ]]; then
+        echo "${base:0:$max_base}${suffix}"
+    else
+        echo "${base}${suffix}"
+    fi
+}
+
+# ── Initialise per-host state files ────────────────────────────
+for i in "${!TARGETS[@]}"; do
+    h="${TARGETS[$i]}"
+    lbl=$(_get_label "$i" "$h")
+    echo "0" > "$TMPD/${lbl}_prev"
+    echo "0" > "$TMPD/${lbl}_lost"  # cumulative loss counter
+done
+
+# ── Helper: ping one host, return RTT or empty string on loss ──
+_ping_one() {
+    local host="$1" tout="$2"
+    # -c 1 = single ping, -W = per-packet timeout, -w = deadline
+    local raw
+    raw=$(ping -c 1 -W "$tout" -w "$tout" "$host" 2>/dev/null) || true
+    # Try grep -P first, fall back to sed for minimal systems
+    local r
+    r=$(echo "$raw" | grep -oP 'time=\K[0-9.]+' 2>/dev/null) || true
+    if [[ -z "$r" ]]; then
+        r=$(echo "$raw" | sed -n 's/.*time=\([0-9.]*\).*/\1/p' 2>/dev/null) || true
+    fi
+    echo "${r:-}"
+}
+
+# ── Convert fractional seconds to ms sleep ─────────────────────
+_sleep_ms() {
+    local ms="$1"
+    local sec
+    if command -v bc &>/dev/null; then
+        sec=$(echo "scale=3; $ms / 1000" | bc -l 2>/dev/null) || sec="0.2"
+    else
+        sec=$(awk -v ms="$ms" 'BEGIN { printf "%.3f", ms/1000 }') || sec="0.2"
+    fi
+    sleep "${sec:-0.2}"
+}
+
+# ── Main loop ──────────────────────────────────────────────────
+while true; do
+    # 1. Fire all pings in PARALLEL — slow hosts never block fast ones
+    for i in "${!TARGETS[@]}"; do
+        host="${TARGETS[$i]}"
+        lbl=$(_get_label "$i" "$host")
+        (
+            r=$(_ping_one "$host" "$TIMEOUT")
+            echo "$r" > "$TMPD/${lbl}_rtt"
+        ) &
+    done
+    wait  # wait for ALL pings to finish (or timeout)
+
+    # 2. Emit KEY=VALUE lines
+    for i in "${!TARGETS[@]}"; do
+        host="${TARGETS[$i]}"
+        lbl=$(_get_label "$i" "$host")
+        r=$(<"$TMPD/${lbl}_rtt")
+        prev=$(<"$TMPD/${lbl}_prev")
+
+        if [[ -z "$r" ]]; then
+            # Packet lost → emit 0 so the bar drops visibly
+            echo "${lbl}=0"
+            if $LOSS; then
+                lost=$(<"$TMPD/${lbl}_lost")
+                lost=$(( lost + 1 ))
+                echo "$lost" > "$TMPD/${lbl}_lost"
+                echo "$(_short_label "$lbl" "_L")=${lost}"
+            fi
+            echo "0" > "$TMPD/${lbl}_prev"
+        else
+            echo "${lbl}=${r}"
+            if $LOSS; then
+                lost=$(<"$TMPD/${lbl}_lost")
+                echo "$(_short_label "$lbl" "_L")=${lost}"
+            fi
+
+            # Optional jitter
+            if $JITTER; then
+                if [[ "$prev" != "0" ]]; then
+                    # Compute absolute difference; bc first, awk fallback
+                    j=""
+                    if command -v bc &>/dev/null; then
+                        j=$(echo "scale=2; d=$r - $prev; if (d < 0) -d else d" | bc -l 2>/dev/null)
+                    else
+                        j=$(awk -v a="$r" -v b="$prev" 'BEGIN { d=a-b; printf "%.2f", (d<0?-d:d) }')
+                    fi
+                    echo "$(_short_label "$lbl" "_J")=${j:-0}"
+                fi
+            fi
+
+            echo "$r" > "$TMPD/${lbl}_prev"
+        fi
+    done
+
+    _sleep_ms "$DELAY_MS"
+done

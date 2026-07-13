@@ -142,6 +142,9 @@ done | ./pipechart -n 60
 
 # From a log file being written
 tail -f /var/log/metrics.log | grep '=' | ./pipechart
+
+# Network latency (ping RTT, jitter, loss) — see PIPING.md
+./piping google.com cloudflare.com | ./pipechart -n 60 -c 1 -h 5
 ```
 
 ---

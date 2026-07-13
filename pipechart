@@ -119,7 +119,11 @@ _autoparse() {
 # Run command / read stdin, capture stderr separately
 _run_cmd() {
     if $USE_STDIN; then
-        timeout "$INTERVAL" cat 2>"$__ERR_TMP" || true
+        local t=$INTERVAL
+        # First read needs longer wait — producer may still be starting up
+        [[ ${__frame_lines:-0} -le 0 ]] && t=$(( INTERVAL * 3 ))
+        [[ $t -lt 2 ]] && t=2
+        timeout "$t" cat 2>"$__ERR_TMP" || true
     else
         local timeout_sec
         timeout_sec=$(echo "$INTERVAL * 2" | bc -l 2>/dev/null | cut -d. -f1 || echo 2)
