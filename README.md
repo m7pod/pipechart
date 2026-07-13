@@ -106,6 +106,15 @@ When auto-detection doesn't work (non `KEY=VALUE` output, or you want specific f
 # CPU temp — sparkline
 ./pipechart -i 2 -m spark vcgencmd measure_temp
 
+# Full dashboard: temp, clocks, voltages, power, throttled — via pistat-kv
+./pistat-kv | ./pipechart -n 60 -c 2 -h 5
+```
+
+`pistat-kv` emits 9 metrics in `KEY=VALUE` format for pipechart auto-detection:
+`Temp`, `CPU`, `Core`, `V3D`, `CoreV`, `CoreA`, `Power`, `EXT5V`, `Thr`.
+See [PIMON.md](./PIMON.md) for dedicated Pi monitor scripts.
+
+```bash
 # Keep 60 data points, 2 columns, compact bars
 ./pipechart -n 60 -c 2 -h 3 vcgencmd pmic_read_adc
 ```
