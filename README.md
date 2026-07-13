@@ -1,34 +1,182 @@
 # pipechart
 
-Live ASCII bar/sparkline charts from periodic command output. Auto-detects `KEY=VALUE` pairs.
+> Live ASCII bar/sparkline charts from periodic command output.
+> Auto-detects `KEY=VALUE` pairs. Just point it at a command.
 
-## Usage
+<p align="center">
+  <i>No dependencies beyond bash, awk, and tput. Runs anywhere.</i>
+</p>
+
+---
+
+## Quick start
 
 ```bash
-# Run a command every 1s and chart all detected metrics
+# Clone
+git clone https://github.com/m7pod/pipechart.git
+cd pipechart
+
+# Run — charts every KEY=VALUE pair automatically
 ./pipechart -i 1 vcgencmd pmic_read_adc
 
-# Sparkline mode
-./pipechart -i 2 -m spark vcgencmd measure_temp
-
-# More history, 2 columns, shorter bars
-./pipechart -n 60 -c 2 -h 3 vcgencmd pmic_read_adc
-
 # Pipe data in
-while true; do vcgencmd pmic_read_adc; sleep 1; done | ./pipechart
+while true; do some-command; sleep 1; done | ./pipechart
+
+# Sparkline mode for a single metric
+./pipechart -i 2 -m spark vcgencmd measure_temp
 ```
+
+---
 
 ## Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-i SEC` | 1 | Poll interval |
-| `-n N` | 30 | History points |
-| `-h N` | 5 | Bar height per metric |
-| `-m MODE` | bar | `bar` or `spark` |
-| `-c COLS` | auto | 1, 2, 3, or 0 for auto-fit |
-| `-e SPEC` | — | Explicit extractor: `"LABEL,UNIT:AWK_CODE"` |
+| `-i SEC` | `1` | Poll interval in seconds |
+| `-n N` | `30` | History points to keep |
+| `-h N` | `5` | Bar height per metric (auto-reduced for multi-column) |
+| `-m MODE` | `bar` | Chart mode: `bar` or `spark` |
+| `-c COLS` | `0` (auto) | Column count: `1`, `2`, `3`, or `0` for auto-fit |
+| `-e SPEC` | — | Explicit metric extractor (repeatable, see below) |
 
-## Auto-adapting layout
+---
 
-Column count and bar height automatically adapt to terminal size. Wide terminals get 3 columns, narrow ones get 1 or 2. Bar height is capped to keep the frame within the visible area.
+## How it works
+
+### Auto-detection
+
+pipechart reads one sample of command output and scans for `KEY=VALUE` patterns:
+
+```
+3V3_WL_SW_A=3.36V
+3V3_SYS_A=3.33V
+1V8_SYS_A=1.80V
+DDR_VDD2_A=1.10V
+```
+
+→ Each line becomes a charted metric with color-coded bars, the label as the key, and the value + unit extracted automatically.
+
+### Layout adaptation
+
+Column count and bar height adapt to your terminal **automatically**:
+
+| Terminal width | Metrics count | Layout |
+|---------------|---------------|--------|
+| ≥ 90 cols | ≥ 9 metrics | **3 columns** |
+| ≥ 70 cols | ≥ 6 metrics | **3 columns** |
+| ≥ 55 cols | ≥ 4 metrics | **2 columns** |
+| ≥ 40 cols | ≥ 2 metrics | **2 columns** |
+| anything else | any | **1 column** |
+
+Bar height is also capped so the full frame fits within your terminal height.
+
+---
+
+## Explicit extraction (`-e`)
+
+When auto-detection doesn't work (non `KEY=VALUE` output, or you want specific fields):
+
+```bash
+# Format: "LABEL,UNIT:AWK_CODE"
+# The colon splits ONCE — awk code can contain colons
+
+# Extract from space-separated output like `sensors`
+./pipechart -e "CPU,°C:/Core 0/{print \$3}" \
+            -e "GPU,°C:/edge/{print \$2}" \
+            -i 2 sensors
+
+# From custom script output
+./pipechart -e "Load,%:/load average:/{print \$3}" \
+            -e "Mem,GB:/Mem:/{print \$2}" \
+            -i 1 uptime
+```
+
+---
+
+## Examples
+
+### Raspberry Pi system monitoring
+
+```bash
+# All PMIC voltages — auto-detected
+./pipechart -i 1 vcgencmd pmic_read_adc
+
+# CPU temp — sparkline
+./pipechart -i 2 -m spark vcgencmd measure_temp
+
+# Keep 60 data points, 2 columns, compact bars
+./pipechart -n 60 -c 2 -h 3 vcgencmd pmic_read_adc
+```
+
+### Generic Linux
+
+```bash
+# CPU load averages
+./pipechart -i 2 -e "1min,:/load average:/{print \$3}" \
+            -e "5min,:/load average:/{print \$4}" \
+            -e "15min,:/load average:/{print \$5}" \
+            uptime
+
+# Memory usage
+./pipechart -i 2 -e "Total,MB:/Mem:/{gsub(/[^0-9]/,\"\",\$2);print \$2}" \
+            -e "Avail,MB:/Mem:/{gsub(/[^0-9]/,\"\",\$7);print \$7}" \
+            free -m
+
+# Disk I/O
+./pipechart -i 1 -e "Read,KB/s:/sda/{print \$3}" \
+            -e "Write,KB/s:/sda/{print \$7}" \
+            iostat -d 1 1
+```
+
+### Piping
+
+```bash
+# From a custom loop
+while true; do
+    echo "temp=$(vcgencmd measure_temp | grep -o '[0-9.]*')"
+    echo "freq=$(vcgencmd measure_clock arm | grep -o '[0-9]*' | head -1)"
+    sleep 1
+done | ./pipechart -n 60
+
+# From a log file being written
+tail -f /var/log/metrics.log | grep '=' | ./pipechart
+```
+
+---
+
+## Dependencies
+
+- **bash** ≥ 4.0
+- **awk** (gawk or mawk)
+- **tput** (from ncurses, for terminal size detection)
+- **bc** (for sub-second sleep precision; falls back gracefully)
+- **timeout** (from coreutils; falls back gracefully)
+
+No Python, Node, Rust, or compilation needed. Every dependency is pre-installed on virtually every Linux distribution and macOS.
+
+---
+
+## Controls
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+C` | Exit (cleans up cursor and temp files) |
+
+---
+
+## Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| "No metrics detected" | Output doesn't contain `KEY=VALUE`. Use `-e` to specify extraction manually. |
+| Title row cut off | Your terminal is too narrow. Resize wider, or use `-c 1` for single-column mode. |
+| Bars all same height | Normal for the first few frames while history builds up. Wait a few seconds. |
+| Flickering | The render buffer should prevent this. If it persists, reduce `-n` (fewer history points). |
+| Command not found | Make sure your command is in `$PATH` or use an absolute path. |
+| Negative or hex values | Hex (`0x...`) is auto-detected. Negative values should work if the command outputs them with a `-` sign. |
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE) file.
