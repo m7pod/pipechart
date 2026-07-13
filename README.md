@@ -38,6 +38,8 @@ while true; do some-command; sleep 1; done | ./pipechart
 | `-m MODE` | `bar` | Chart mode: `bar` or `spark` |
 | `-c COLS` | `0` (auto) | Column count: `1`, `2`, `3`, or `0` for auto-fit |
 | `-e SPEC` | — | Explicit metric extractor (repeatable, see below) |
+| `-o FILE` | — | Log metrics to file (appends each sample) |
+| `-f FMT` | `txt` | Log format: `csv` or `txt` |
 
 ---
 
@@ -140,6 +142,32 @@ done | ./pipechart -n 60
 
 # From a log file being written
 tail -f /var/log/metrics.log | grep '=' | ./pipechart
+```
+
+---
+
+## Logging to file (`-o`, `-f`)
+
+Log every sample to a file while the chart runs. Writes are fast and non-blocking.
+
+```bash
+# TXT format (default): human-readable, one line per sample
+./pipechart -i 1 -o metrics.log vcgencmd pmic_read_adc
+# → [2026-07-13T17:30:00+08:00] 3V3_WL_SW_A=3.36     3V3_SYS_A=3.33     ...
+
+# CSV format: header row + comma-separated, ready for Excel / pandas
+./pipechart -i 1 -o metrics.csv -f csv vcgencmd pmic_read_adc
+# → timestamp,3V3_WL_SW_A,3V3_SYS_A,...
+# → 2026-07-13T17:30:00+08:00,3.36,3.33,...
+```
+
+Combine with `-e` for custom labels:
+
+```bash
+./pipechart -i 2 -o temps.csv -f csv \
+    -e "CPU,°C:/temp/{print \$2}" \
+    -e "GPU,°C:/temp/{print \$4}" \
+    sensors
 ```
 
 ---

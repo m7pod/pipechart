@@ -31,6 +31,8 @@ Options:
   -m MODE   bar | spark (default: bar)
   -c COLS   1, 2, 3, or 0=auto (default: 0, fits up to 3 cols by width)
   -e SPEC   Explicit extractor: "LABEL,UNIT:AWK_CODE" (repeatable)
+  -o FILE   Log metrics to file (async, non-blocking)
+  -f FMT    Log format: csv | txt (default: txt)
 
 Examples:
   pipechart -i 1 vcgencmd pmic_read_adc
@@ -42,9 +44,11 @@ EOF
 
 # ── Globals ──
 INTERVAL=1; HISTORY=30; BARH=5; MODE=bar; COLS=0
+LOG_FILE=""; LOG_FMT="txt"
 CMD=(); USE_STDIN=false
 declare -a USER_LABELS=() USER_UNITS=() USER_AWKCODES=()
 declare -a LABELS=() UNITS=() AWKCODES=() DATA=()
+__LOG_FD=""
 
 # ── Layout cache ──
 __tw=-1; __th=-1; __pw=-1; __cols=-1; __barh=-1; __mode=""
@@ -74,6 +78,8 @@ parse_args() {
                  shift 2 ;;
             --help) usage ;;
             --) shift; CMD=("$@"); break ;;
+            -o) LOG_FILE="$2"; shift 2 ;;
+            -f) LOG_FMT="$2"; shift 2 ;;
             -*) echo "Unknown option: $1" >&2; usage ;;
             *)  CMD=("$@"); break ;;
         esac
@@ -115,8 +121,9 @@ _run_cmd() {
     if $USE_STDIN; then
         timeout "$INTERVAL" cat 2>"$__ERR_TMP" || true
     else
-        local timeout_sec=$(( INTERVAL * 2 ))
-        [[ $timeout_sec -lt 2 ]] && timeout_sec=2
+        local timeout_sec
+        timeout_sec=$(echo "$INTERVAL * 2" | bc -l 2>/dev/null | cut -d. -f1 || echo 2)
+        [[ -z "$timeout_sec" || $timeout_sec -lt 2 ]] && timeout_sec=2
         if command -v timeout &>/dev/null; then
             timeout "$timeout_sec" "${CMD[@]}" 2>"$__ERR_TMP" || true
         else
@@ -145,8 +152,8 @@ _collect() {
 _extract() {
     local raw; raw=$(echo "$1" | awk "$2" 2>/dev/null | head -1)
     if [[ -z "$raw" ]]; then echo "0"; return; fi
-    # Extract valid number (integer or decimal)
-    local num; num=$(echo "$raw" | sed -n 's/.*\([0-9]\+\.[0-9]\+\|[0-9]\+\).*/\1/p' | head -1)
+    # Extract first integer or decimal number
+    local num; num=$(echo "$raw" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
     echo "${num:-0}"
 }
 
@@ -193,10 +200,45 @@ discover_metrics() {
     fi
 }
 
+_start_logger() {
+    [[ -z "$LOG_FILE" ]] && return
+    # Open log file for append (fd 9)
+    exec 9>>"$LOG_FILE"
+    __LOG_FD=9
+
+    if [[ "$LOG_FMT" == "csv" ]]; then
+        # Write CSV header
+        echo "timestamp,$(IFS=,; echo "${LABELS[*]}")" >&9
+    fi
+    echo "Logging to $LOG_FILE ($LOG_FMT format)" >&2
+}
+
+_log_sample() {
+    [[ -z "$__LOG_FD" ]] && return
+    local ts; ts=$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date +%s)
+    local -a vals=()
+    for ((i=0; i<N; i++)); do
+        local v="${DATA[$i]##* }"
+        [[ -z "$v" ]] && v="0"
+        vals+=("$v")
+    done
+    if [[ "$LOG_FMT" == "csv" ]]; then
+        printf '%s,%s\n' "$ts" "$(IFS=,; echo "${vals[*]}")" >&"$__LOG_FD"
+    else
+        printf '[%s]' "$ts" >&"$__LOG_FD"
+        for ((i=0; i<N; i++)); do
+            printf ' %s=%-8s' "${LABELS[$i]}" "${vals[$i]}" >&"$__LOG_FD"
+        done
+        printf '\n' >&"$__LOG_FD"
+    fi
+}
+
 cleanup() {
     local rc=$?
     tput cnorm 2>/dev/null || true
     printf "\033[?25h\n"
+    # Close log fd
+    [[ -n "$__LOG_FD" ]] && exec {__LOG_FD}>&- 2>/dev/null || true
     rm -f "$__RENDER_TMP" "$__ERR_TMP"
     exit ${rc:-0}
 }
@@ -624,6 +666,9 @@ main() {
         DATA[$i]="$val"
     done
 
+    # Start async logger (after LABELS are known)
+    _start_logger
+
     while true; do
         t0=${EPOCHREALTIME:-$(date +%s.%N 2>/dev/null || echo $(date +%s))}
 
@@ -642,6 +687,9 @@ main() {
                 DATA[$i]="${arr[*]: -$HISTORY}"
             fi
         done
+
+        # Write sample to log file (async via FIFO, never blocks)
+        _log_sample
 
         render
 
