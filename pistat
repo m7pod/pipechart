@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# pistat - Pi hardware status (one-shot snapshot)
+# Usage: pistat
+
+pistat() {
+    local vc=/usr/bin/vcgencmd
+    local t=$($vc measure_temp | sed 's/temp=//')
+    local arm=$($vc measure_clock arm | awk -F= '{printf "%.0f MHz",$2/1e6}')
+    local core=$($vc measure_clock core | awk -F= '{printf "%.0f MHz",$2/1e6}')
+    local v3d=$($vc measure_clock v3d | awk -F= '{printf "%.0f MHz",$2/1e6}')
+    local pmic=$($vc pmic_read_adc)
+    local v=$(echo "$pmic" | awk '/VDD_CORE_V/{sub(/.*=/,"",$NF); sub(/V$/,"",$NF); printf "%.3f V",$NF}')
+    local a=$(echo "$pmic" | awk '/VDD_CORE_A/{sub(/.*=/,"",$NF); sub(/A$/,"",$NF); printf "%.3f A",$NF}')
+    local w=$(echo "$pmic" | awk '/VDD_CORE_V/{sub(/.*=/,"",$NF); sub(/V$/,"",$NF); v=$NF} /VDD_CORE_A/{sub(/.*=/,"",$NF); sub(/A$/,"",$NF); a=$NF} END{printf "%.2f W",v*a}')
+    local vin=$(echo "$pmic" | awk '/EXT5V_V/{sub(/.*=/,"",$NF); sub(/V$/,"",$NF); printf "%.3f V",$NF}')
+    local thr=$($vc get_throttled | sed 's/throttled=//')
+    printf '%-14s %s\n' 'ITEM' 'VALUE'
+    printf '%.0s─' {1..30}; echo
+    printf '%-14s %s\n' 'Temp' "$t" 'CPU Clock' "$arm" 'Core Clock' "$core" 'V3D Clock' "$v3d"
+    printf '%-14s %s\n' 'Core Volt' "$v" 'Core Curr' "$a" 'Core Power' "$w" 'EXT 5V' "$vin" 'Throttled' "$thr"
+}
+
+pistat "$@"

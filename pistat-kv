@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# pistat-kv — pistat output in KEY=VALUE format for pipechart auto-detection
+# Usage: ./pistat-kv
+
+vc=/usr/bin/vcgencmd
+
+# Temp (strip 'C suffix, just the number)
+t=$($vc measure_temp | sed "s/temp=//;s/'C//")
+
+# Clocks (just MHz number)
+arm=$($vc measure_clock arm | awk -F= '{printf "%.0f", $2/1e6}')
+core=$($vc measure_clock core | awk -F= '{printf "%.0f", $2/1e6}')
+v3d=$($vc measure_clock v3d | awk -F= '{printf "%.0f", $2/1e6}')
+
+# PMIC
+pmic=$($vc pmic_read_adc)
+v=$(echo "$pmic" | awk '/VDD_CORE_V/{sub(/.*=/,"",$NF); sub(/V$/,"",$NF); printf "%.3f",$NF}')
+a=$(echo "$pmic" | awk '/VDD_CORE_A/{sub(/.*=/,"",$NF); sub(/A$/,"",$NF); printf "%.3f",$NF}')
+w=$(echo "$pmic" | awk '/VDD_CORE_V/{sub(/.*=/,"",$NF); sub(/V$/,"",$NF); v=$NF} /VDD_CORE_A/{sub(/.*=/,"",$NF); sub(/A$/,"",$NF); a=$NF} END{printf "%.2f",v*a}')
+vin=$(echo "$pmic" | awk '/EXT5V_V/{sub(/.*=/,"",$NF); sub(/V$/,"",$NF); printf "%.3f",$NF}')
+
+# Throttled
+thr=$($vc get_throttled | sed 's/throttled=//')
+
+# KEY=VALUE output (pipechart auto-detects these)
+echo "Temp=$t"
+echo "CPU=$arm"
+echo "Core=$core"
+echo "V3D=$v3d"
+echo "CoreV=$v"
+echo "CoreA=$a"
+echo "Power=$w"
+echo "EXT5V=$vin"
+echo "Thr=$thr"
