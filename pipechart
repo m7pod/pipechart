@@ -1,0 +1,664 @@
+#!/usr/bin/env bash
+# pipechart — Live ASCII charts from periodic command output.
+# Auto-detects KEY=VALUE pairs. Just point it at a command.
+#
+# Usage:
+#   pipechart [-i SEC] [-n HIST] [-h ROWS] [-m bar|spark] [-c COLS] COMMAND [ARGS...]
+#   pipechart [-i SEC] [-n HIST] [-h ROWS] [-m bar|spark] < stdin
+#
+# Examples:
+#   pipechart -i 1 vcgencmd pmic_read_adc
+#   pipechart -i 2 -m spark vcgencmd measure_temp
+#   pipechart -n 60 -h 3 -c 2 vcgencmd pmic_read_adc
+
+set -euo pipefail
+COLORS=(196 46 226 51 201 21 220 33 200 45 166 27)
+
+usage() {
+    cat <<'EOF'
+pipechart — Live ASCII charts with auto-detection
+
+Usage:
+  pipechart [OPTS] COMMAND [ARGS...]    run COMMAND every -i seconds
+  pipechart [OPTS] < stdin              read samples from pipe
+
+Options:
+  -i SEC    Poll interval (default: 1)
+  -n N      History points (default: 30)
+  -h N      Bar height per metric  (default: 5, auto-reduced in multi-col)
+  -m MODE   bar | spark (default: bar)
+  -c COLS   1, 2, 3, or 0=auto (default: 0, fits up to 3 cols by width)
+  -e SPEC   Explicit extractor: "LABEL,UNIT:AWK_CODE" (repeatable)
+
+Examples:
+  pipechart -i 1 vcgencmd pmic_read_adc
+  pipechart -n 60 -c 2 -h 3 vcgencmd pmic_read_adc
+  while true; do vcgencmd pmic_read_adc; sleep 1; done | pipechart
+EOF
+    exit 0
+}
+
+# ── Globals ──
+INTERVAL=1; HISTORY=30; BARH=5; MODE=bar; COLS=0  # 0 = auto
+CMD=(); USE_STDIN=false
+declare -a USER_LABELS=() USER_UNITS=() USER_AWKCODES=()
+declare -a LABELS=() UNITS=() AWKCODES=() DATA=()
+
+# ── Layout cache ──
+__pw=-1; __tw=-1; __th=-1; __cols=-1; __barh=-1; __mode=""
+__frame_lines=-1
+__col_w=0; __cw=0; __bar_area=0; __sw=0; __lbw=10; __vlw=8; __unw=3
+__hr_full=""; __hr_col=""
+__src=""
+
+# ── Parse CLI ──
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -i) INTERVAL="$2"; shift 2 ;;
+            -n) HISTORY="$2"; shift 2 ;;
+            -h) BARH="$2"; shift 2 ;;
+            -m) MODE="$2"; shift 2 ;;
+            -c) COLS="$2"; shift 2 ;;
+            -e) local ext="$2"
+                 local label_unit="${ext%%:*}" awk_code="${ext#*:}"
+                 local label="${label_unit%%,*}" unit="${label_unit#*,}"
+                 [[ "$unit" == "$label_unit" ]] && unit=""
+                 USER_LABELS+=("$label"); USER_UNITS+=("$unit")
+                 USER_AWKCODES+=("$awk_code")
+                 shift 2 ;;
+            --help) usage ;;
+            --) shift; CMD=("$@"); break ;;
+            -*) echo "Unknown option: $1" >&2; usage ;;
+            *)  CMD=("$@"); break ;;
+        esac
+    done
+    if [[ ${#CMD[@]} -eq 0 ]]; then
+        if [[ -t 0 ]]; then
+            echo "ERROR: no COMMAND and stdin is a terminal." >&2
+            echo "Usage: pipechart [opts] COMMAND   or   producer | pipechart" >&2
+            exit 1
+        fi
+        USE_STDIN=true
+    fi
+}
+
+# ── Auto-parse KEY=VALUE output ──
+_autoparse() {
+    awk '
+    /=/ && /[0-9]/ {
+        rest=$0; label=$1
+        if(label==rest&&index(rest,"=")>0) label=substr(rest,1,index(rest,"=")-1)
+        gsub(/[(][^)]*[)]/,"",label)
+        gsub(/[^a-zA-Z0-9_]+$/,"",label)
+        if(label=="")next
+        idx=index(rest,"=");if(idx==0)next
+        tail=substr(rest,idx+1);sub(/^[[:space:]]+/,"",tail)
+        num=""
+        if(match(tail,/^0x[0-9a-fA-F]+/))num=substr(tail,RSTART,RLENGTH)
+        else if(match(tail,/^[0-9]+(\.[0-9]+)?/))num=substr(tail,RSTART,RLENGTH)
+        else next
+        unit="";us=RSTART+RLENGTH
+        if(us<=length(tail)){ustr=substr(tail,us);sub(/^[^A-Za-z]+/,"",ustr)
+            if(match(ustr,/^[A-Za-z%°]+/))unit=substr(ustr,RSTART,RLENGTH)}
+        if(label!=""&&num!="")printf "%s|%s|%s\n",label,unit,num
+    }'
+}
+
+_collect() {
+    if $USE_STDIN; then
+        timeout "$INTERVAL" cat 2>/dev/null || true
+    else
+        local timeout_sec=$(( INTERVAL * 2 ))
+        [[ $timeout_sec -lt 2 ]] && timeout_sec=2
+        if command -v timeout &>/dev/null; then
+            timeout "$timeout_sec" "${CMD[@]}" 2>/dev/null || true
+        else
+            "${CMD[@]}" 2>/dev/null || true
+        fi
+    fi
+}
+
+_extract() { echo "$1" | awk "$2" 2>/dev/null | { head -1; cat >/dev/null; } | sed 's/[^0-9.]//g' || echo "0"; }
+
+_elapsed_ms() {
+    local s=${1%%.*} f=${1#*.}
+    [[ "$f" == "$1" ]] && f=0
+    f=${f##0}; [[ -z "$f" ]] && f=0
+    local ms
+    ms=$({ echo $(( ($(date +%s%N 2>/dev/null||echo 0) - s*1000000000 + f*1000) / 1000000 )); } 2>/dev/null || echo 0)
+    [[ $ms -lt 0 ]] && ms=0
+    echo "$ms"
+}
+
+discover_metrics() {
+    local output="$1"
+    if [[ ${#USER_LABELS[@]} -gt 0 ]]; then
+        LABELS=("${USER_LABELS[@]}"); UNITS=("${USER_UNITS[@]}"); AWKCODES=("${USER_AWKCODES[@]}")
+        return
+    fi
+    LABELS=(); UNITS=(); AWKCODES=()
+    while IFS='|' read -r lbl unt num; do
+        [[ -z "$lbl" ]] && continue
+        local dup=false
+        for e in "${LABELS[@]}"; do
+            if [[ "$e" == "$lbl" ]]; then dup=true; break; fi
+        done
+        $dup && continue
+        LABELS+=("$lbl"); UNITS+=("$unt")
+        local awkpgm="/${lbl}/ && /=/{v=\$0;sub(/.*=/,\"\",v);sub(/^[[:space:]]+/,\"\",v);if(match(v,/^[0-9]+(\\.[0-9]+)?/))print substr(v,RSTART,RLENGTH)}"
+        AWKCODES+=("$awkpgm")
+    done < <(echo "$output" | _autoparse)
+    if [[ ${#LABELS[@]} -eq 0 ]]; then
+        echo "ERROR: no metrics detected." >&2
+        exit 1
+    fi
+}
+
+cleanup() { local rc=$?; tput cnorm 2>/dev/null; printf "\033[?25h\n"; exit ${rc:-0}; }
+
+# ═══════════════════════════════════════════════════════════════
+#  LAYOUT CALCULATION  (auto-adapts to terminal size)
+# ═══════════════════════════════════════════════════════════════
+
+_calc_layout() {
+    local tw th pw cols bar_h col_w
+    tw=$(tput cols 2>/dev/null || echo 80)
+    th=$(tput lines 2>/dev/null || echo 24)
+    pw=$(( tw - 2 ))
+
+    # ── Column auto-detection (used when COLS=0) ──
+    cols=$COLS
+    if [[ $cols -eq 0 ]]; then
+        # Each column needs: label(10)+value(8)+unit(3)+border(2)+bar_min(5) ≈ 28 min
+        # But we can go narrower for 3-col if screen is wide
+        local min_col_3=22   # tight 3-col: label(6)+val(7)+unit(2)+padding(3)+bar(4)
+        local min_col_2=30   # comfortable 2-col
+        local min_col_1=40   # roomy 1-col
+
+        # Try 3 columns if wide enough AND enough metrics to fill
+        if [[ $N -ge 3 && $pw -ge $(( min_col_3 * 3 + 4 )) ]]; then
+            cols=3
+        elif [[ $N -ge 4 && $pw -ge $(( min_col_2 * 2 + 2 )) ]]; then
+            cols=2
+        elif [[ $tw -ge 100 && $N -ge 3 ]]; then
+            cols=3
+        elif [[ $tw -ge 60 && $N -ge 2 ]]; then
+            cols=2
+        else
+            cols=1
+        fi
+    fi
+    [[ $cols -gt 3 ]] && cols=3
+    [[ $cols -lt 1 ]] && cols=1
+    # Don't use more columns than metrics
+    [[ $cols -gt $N ]] && cols=$N
+    # Spark mode always uses 1 column
+    [[ "$MODE" == "spark" ]] && cols=1
+
+    # ── Bar height: auto-reduce based on column count and available rows ──
+    bar_h=$BARH
+    # Reserve rows for header (3) + status (1) = 4 rows
+    local avail=$(( th - 4 ))
+
+    if [[ $cols -ge 3 ]]; then
+        # 3-col: need space for title+bar+footer per metric row
+        bar_h=$(( (BARH + 2) / 3 ))
+    elif [[ $cols -eq 2 ]]; then
+        bar_h=$(( (BARH + 1) / 2 ))
+    fi
+    [[ $bar_h -lt 2 ]] && bar_h=2
+
+    # Cap bar height so the frame fits in terminal
+    local metric_rows=$(( (N + cols - 1) / cols ))
+    local needed=$(( metric_rows * (bar_h + 2) + 4 ))
+    while [[ $needed -gt $th && $bar_h -gt 2 ]]; do
+        bar_h=$(( bar_h - 1 ))
+        needed=$(( metric_rows * (bar_h + 2) + 4 ))
+    done
+
+    col_w=$(( pw / cols ))
+
+    # ── Adaptive label/value/unit widths based on column width ──
+    if [[ $col_w -lt 25 ]]; then
+        __lbw=6; __vlw=7; __unw=2   # tight: short labels + values
+    elif [[ $col_w -lt 35 ]]; then
+        __lbw=8; __vlw=8; __unw=2   # medium
+    else
+        __lbw=10; __vlw=8; __unw=3  # roomy
+    fi
+
+    # Detect layout changes
+    if [[ "$__tw" == "$tw" && "$__th" == "$th" &&
+          "$__pw" == "$pw" && "$__cols" == "$cols" &&
+          "$__barh" == "$bar_h" && "$__mode" == "$MODE" &&
+          "$__frame_lines" -gt 0 ]]; then
+        return 1  # same → dynamic update
+    fi
+
+    # Save layout
+    __tw=$tw; __th=$th; __pw=$pw; __cols=$cols; __barh=$bar_h; __mode=$MODE
+    __col_w=$col_w
+
+    # Border strings
+    __hr_full=$(printf '%.0s─' $(seq $pw))
+    if [[ $cols -ge 2 ]]; then
+        __hr_col=$(printf '%.0s─' $(seq $((col_w - 1))))
+    else
+        __hr_col=""
+    fi
+
+    # Bar geometry
+    local pad=$(( __lbw + __vlw + __unw + 4 ))   # label + value + unit + borders
+    __bar_area=$(( col_w - pad ))
+    [[ $__bar_area -lt 4 ]] && __bar_area=4
+    __cw=$(( __bar_area / HISTORY ))
+    [[ $__cw -lt 1 ]] && __cw=1; [[ $__cw -gt 3 ]] && __cw=3
+    __visible=$(( __bar_area / __cw ))
+    [[ $__visible -gt $HISTORY ]] && __visible=$HISTORY
+    [[ $__visible -lt 1 ]] && __visible=1
+
+    __sw=$(( pw - 28 ))  # spark width
+
+    if $USE_STDIN; then __src="stdin"; else __src="${CMD[*]}"; fi
+    # Truncate long source strings in header
+    local max_src=$(( pw - 52 ))
+    if [[ ${#__src} -gt $max_src && $max_src -gt 4 ]]; then
+        __src="${__src:0:$((max_src - 3))}..."
+    fi
+
+    return 0  # layout changed → full redraw
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  HELPERS: build data for one row of columns
+# ═══════════════════════════════════════════════════════════════
+
+_build_row() {
+    local i=$1
+    _ncol=0
+    _ci=(); _cl=(); _cu=(); _cd=(); _cv=(); _ct=()
+    local end=$(( i + __cols ))
+    [[ $end -gt $N ]] && end=$N
+    for ((idx=i; idx<end; idx++)); do
+        local color=${COLORS[$((idx % ${#COLORS[@]}))]}
+        local label="${LABELS[$idx]}"
+        local unit="${UNITS[$idx]}"
+        local data="${DATA[$idx]}"
+        local latest="${data##* }"
+        [[ -z "$latest" || "$latest" == "$data" ]] && latest="${data:-0}"
+        _ci+=($idx); _cl+=($color); _cu+=("$label"); _cd+=("$unit"); _cv+=("$data"); _ct+=("$latest")
+    done
+    _ncol=${#_ci[@]}
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  LINE RENDERERS
+# ═══════════════════════════════════════════════════════════════
+
+_render_header_line() {
+    local ts; ts=$(date +%H:%M:%S)
+    local src_pad=$(( __pw - 50 - ${#__src} ))
+    [[ $src_pad -lt 1 ]] && src_pad=1
+    printf "\r\033[K│ \033[1;37mpipechart\033[0m │ \033[33m%ds\033[0m │ \033[33m%dpt\033[0m │ \033[33m%dx%d\033[0m │ \033[33m%4s\033[0m │ \033[90m%s\033[0m%*s│\n" \
+        "$INTERVAL" "$HISTORY" "$__cols" "$__barh" "$__mode" "$ts" "$src_pad" ""
+}
+
+# Emit a multi-column title row — plain string length MUST match ANSI visible width
+_render_title_row() {
+    local n=$_ncol
+    local -a parts=() widths=()
+
+    for ((c=0; c<n; c++)); do
+        local color=${_cl[$c]} label=${_cu[$c]} unit=${_cd[$c]} latest=${_ct[$c]}
+
+        # Truncate label if too long
+        if [[ ${#label} -gt $__lbw ]]; then
+            label="${label:0:$((__lbw - 1))}…"
+        fi
+
+        # ANSI-formatted title
+        local title
+        title=$(printf '\033[38;5;%dm%-*s\033[0m\033[1m%*s\033[0m%-*s' \
+            "$color" "$__lbw" "$label" "$__vlw" "$latest" "$__unw" "$unit")
+
+        # Plain version has EXACT same visible width
+        local title_plain
+        title_plain=$(printf "%-*s%*s%-*s" "$__lbw" "$label" "$__vlw" "$latest" "$__unw" "$unit")
+
+        parts+=("$title")
+        widths+=(${#title_plain})
+    done
+
+    printf "\r\033[K┌"
+    for ((c=0; c<n; c++)); do
+        local sep='┬'
+        [[ $c -eq $((n-1)) ]] && sep='┐'
+
+        if [[ $c -eq $((n-1)) ]]; then
+            # Last column absorbs remainder so border lines up with full width
+            local used=$(( (n-1) * __col_w ))
+            local remain=$(( __pw - used ))
+            local pad=$(( remain - ${widths[$c]} - 1 ))
+            [[ $pad -lt 0 ]] && pad=0
+            printf '%s%*s%s\n' "${parts[$c]}" $pad '' "$sep"
+        else
+            local pad=$(( __col_w - ${widths[$c]} - 1 ))
+            [[ $pad -lt 0 ]] && pad=0
+            printf '%s%*s%s' "${parts[$c]}" $pad '' "$sep"
+        fi
+    done
+}
+
+# Emit bar rows for 1-3 columns — single awk call, matched to column width
+_render_bar_block() {
+    local n=$_ncol
+
+    # Trim each column's data to __visible history points
+    local -a datas=() colors=()
+    for ((c=0; c<n; c++)); do
+        local data="${_cv[$c]}"
+        local -a tmp_arr=($data)
+        [[ ${#tmp_arr[@]} -gt $__visible ]] && data="${tmp_arr[*]: -$__visible}"
+        datas+=("$data")
+        colors+=("${_cl[$c]}")
+    done
+
+    # Build and run awk for each column count
+    if [[ $n -eq 1 ]]; then
+        echo | awk -v data="${datas[0]}" -v H="$__barh" -v cw="$__cw" \
+            -v ba="$__bar_area" -v cl="${colors[0]}" '
+        BEGIN { _bar_one(data, H, cw, ba, cl) }
+        function _bar_one(data, H, cw, ba, cl,    n,vals,min,max,range,floor,h,i,j,row,rem) {
+            n = split(data, vals, " ")
+            if (n > 0) {
+                min=vals[1]; max=vals[1]
+                for(i=1;i<=n;i++){if(vals[i]<min)min=vals[i];if(vals[i]>max)max=vals[i]}
+                range=max-min
+                if(range==0){for(i=1;i<=n;i++)h[i]=int(H/2)}
+                else{floor=(max>0?max*0.001:0.001);if(floor<0.001)floor=0.001
+                     if(range<floor)range=floor
+                     for(i=1;i<=n;i++){h[i]=int(((vals[i]-min)/range)*H);if(h[i]<0)h[i]=0;if(h[i]>H)h[i]=H}}
+            }
+            for(row=H;row>=1;row--){
+                printf "\r\033[K│"
+                for(i=1;i<=n;i++){
+                    if(h[i]>=row){for(j=1;j<=cw;j++)printf "\033[38;5;%dm█\033[0m",cl}
+                    else printf "%*s",cw,""
+                }
+                rem=ba-n*cw;if(rem>0)printf "%*s",rem,""
+                printf "│\n"
+            }
+        }'
+
+    elif [[ $n -eq 2 ]]; then
+        echo | awk -v d0="${datas[0]}" -v d1="${datas[1]}" \
+            -v H="$__barh" -v cw="$__cw" -v ba="$__bar_area" \
+            -v c0="${colors[0]}" -v c1="${colors[1]}" '
+        BEGIN { _bar_two(d0,d1,H,cw,ba,c0,c1) }
+        function _bar_two(d0,d1,H,cw,ba,c0,c1,
+            n0,v0,min0,max0,range0,floor,h0,
+            n1,v1,min1,max1,range1,floor1,h1,
+            i,j,row,rem)
+        {
+            n0=split(d0,v0," "); n1=split(d1,v1," ")
+            if(n0>0){min0=v0[1];max0=v0[1];for(i=1;i<=n0;i++){if(v0[i]<min0)min0=v0[i];if(v0[i]>max0)max0=v0[i]}
+                range0=max0-min0
+                if(range0==0){for(i=1;i<=n0;i++)h0[i]=int(H/2)}
+                else{floor=(max0>0?max0*0.001:0.001);if(floor<0.001)floor=0.001
+                     if(range0<floor)range0=floor
+                     for(i=1;i<=n0;i++){h0[i]=int(((v0[i]-min0)/range0)*H);if(h0[i]<0)h0[i]=0;if(h0[i]>H)h0[i]=H}}}
+            if(n1>0){min1=v1[1];max1=v1[1];for(i=1;i<=n1;i++){if(v1[i]<min1)min1=v1[i];if(v1[i]>max1)max1=v1[i]}
+                range1=max1-min1
+                if(range1==0){for(i=1;i<=n1;i++)h1[i]=int(H/2)}
+                else{floor=(max1>0?max1*0.001:0.001);if(floor<0.001)floor=0.001
+                     if(range1<floor)range1=floor
+                     for(i=1;i<=n1;i++){h1[i]=int(((v1[i]-min1)/range1)*H);if(h1[i]<0)h1[i]=0;if(h1[i]>H)h1[i]=H}}}
+            for(row=H;row>=1;row--){
+                printf "\r\033[K│"
+                for(i=1;i<=n0;i++){if(h0[i]>=row){for(j=1;j<=cw;j++)printf "\033[38;5;%dm█\033[0m",c0}else printf "%*s",cw,""}
+                rem=ba-n0*cw;if(rem>0)printf "%*s",rem,""
+                printf "│"
+                for(i=1;i<=n1;i++){if(h1[i]>=row){for(j=1;j<=cw;j++)printf "\033[38;5;%dm█\033[0m",c1}else printf "%*s",cw,""}
+                rem=ba-n1*cw;if(rem>0)printf "%*s",rem,""
+                printf "│\n"
+            }
+        }'
+
+    else  # n == 3
+        echo | awk -v d0="${datas[0]}" -v d1="${datas[1]}" -v d2="${datas[2]}" \
+            -v H="$__barh" -v cw="$__cw" -v ba="$__bar_area" \
+            -v c0="${colors[0]}" -v c1="${colors[1]}" -v c2="${colors[2]}" '
+        BEGIN { _bar_three(d0,d1,d2,H,cw,ba,c0,c1,c2) }
+        function _bar_three(d0,d1,d2,H,cw,ba,c0,c1,c2,
+            n0,v0,min0,max0,range0,floor,h0,
+            n1,v1,min1,max1,range1,floor1,h1,
+            n2,v2,min2,max2,range2,floor2,h2,
+            i,j,row,rem)
+        {
+            n0=split(d0,v0," "); n1=split(d1,v1," "); n2=split(d2,v2," ")
+            if(n0>0){min0=v0[1];max0=v0[1];for(i=1;i<=n0;i++){if(v0[i]<min0)min0=v0[i];if(v0[i]>max0)max0=v0[i]}
+                range0=max0-min0
+                if(range0==0){for(i=1;i<=n0;i++)h0[i]=int(H/2)}
+                else{floor=(max0>0?max0*0.001:0.001);if(floor<0.001)floor=0.001
+                     if(range0<floor)range0=floor
+                     for(i=1;i<=n0;i++){h0[i]=int(((v0[i]-min0)/range0)*H);if(h0[i]<0)h0[i]=0;if(h0[i]>H)h0[i]=H}}}
+            if(n1>0){min1=v1[1];max1=v1[1];for(i=1;i<=n1;i++){if(v1[i]<min1)min1=v1[i];if(v1[i]>max1)max1=v1[i]}
+                range1=max1-min1
+                if(range1==0){for(i=1;i<=n1;i++)h1[i]=int(H/2)}
+                else{floor=(max1>0?max1*0.001:0.001);if(floor<0.001)floor=0.001
+                     if(range1<floor)range1=floor
+                     for(i=1;i<=n1;i++){h1[i]=int(((v1[i]-min1)/range1)*H);if(h1[i]<0)h1[i]=0;if(h1[i]>H)h1[i]=H}}}
+            if(n2>0){min2=v2[1];max2=v2[1];for(i=1;i<=n2;i++){if(v2[i]<min2)min2=v2[i];if(v2[i]>max2)max2=v2[i]}
+                range2=max2-min2
+                if(range2==0){for(i=1;i<=n2;i++)h2[i]=int(H/2)}
+                else{floor=(max2>0?max2*0.001:0.001);if(floor<0.001)floor=0.001
+                     if(range2<floor)range2=floor
+                     for(i=1;i<=n2;i++){h2[i]=int(((v2[i]-min2)/range2)*H);if(h2[i]<0)h2[i]=0;if(h2[i]>H)h2[i]=H}}}
+            for(row=H;row>=1;row--){
+                printf "\r\033[K│"
+                for(i=1;i<=n0;i++){if(h0[i]>=row){for(j=1;j<=cw;j++)printf "\033[38;5;%dm█\033[0m",c0}else printf "%*s",cw,""}
+                rem=ba-n0*cw;if(rem>0)printf "%*s",rem,""
+                printf "│"
+                for(i=1;i<=n1;i++){if(h1[i]>=row){for(j=1;j<=cw;j++)printf "\033[38;5;%dm█\033[0m",c1}else printf "%*s",cw,""}
+                rem=ba-n1*cw;if(rem>0)printf "%*s",rem,""
+                printf "│"
+                for(i=1;i<=n2;i++){if(h2[i]>=row){for(j=1;j<=cw;j++)printf "\033[38;5;%dm█\033[0m",c2}else printf "%*s",cw,""}
+                rem=ba-n2*cw;if(rem>0)printf "%*s",rem,""
+                printf "│\n"
+            }
+        }'
+    fi
+}
+
+# Emit spark row for single metric
+_render_spark_row() {
+    local i=$1
+    local color=${COLORS[$((i % ${#COLORS[@]}))]}
+    local label="${LABELS[$i]}" unit="${UNITS[$i]}" data="${DATA[$i]}"
+    local latest="${data##* }"
+    [[ -z "$latest" || "$latest" == "$data" ]] && latest="${data:-0}"
+
+    printf "\r\033[K│ \033[38;5;%dm%-10s\033[0m \033[1m%8s\033[0m %-3s " "$color" "$label" "$latest" "$unit"
+    echo "$data" | awk -v w="$__sw" -v c="$color" '
+    BEGIN{bs="▁▂▃▄▅▆▇█"}
+    {min=$1;max=$1;for(i=1;i<=NF;i++){if($i<min)min=$i;if($i>max)max=$i}
+     range=max-min;if(range==0)range=1
+     for(i=1;i<=NF&&i<=w;i++){lvl=int((($i-min)/range)*7)+1
+       if(lvl<1)lvl=1;if(lvl>8)lvl=8
+       printf "\033[38;5;%dm%s\033[0m",c,substr(bs,lvl*3-2,3)}
+     for(i=NF+1;i<=w;i++)printf " "}'
+    printf " │\n"
+}
+
+# Emit footer separator for a row of columns
+_render_footer() {
+    local n=$_ncol
+    if [[ $n -eq 1 ]]; then
+        printf "\r\033[K└%s┘\n" "$__hr_full"
+    else
+        printf "\r\033[K└"
+        for ((c=0; c<n; c++)); do
+            [[ $c -gt 0 ]] && printf '┴'
+            printf '%s' "$__hr_col"
+        done
+        printf '┘\n'
+    fi
+}
+
+# Emit bottom status line
+_render_status_line() {
+    printf "\r\033[K│ \033[0;33mCtrl+C\033[0m exit │ \033[90m%4dms\033[0m%*s│\n" \
+        "$(_elapsed_ms "$t0")" $((__pw - 26)) ""
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  FULL RENDER  (first draw or after terminal resize)
+# ═══════════════════════════════════════════════════════════════
+
+_render_full() {
+    printf '\033[H\033[2J'   # home + clear
+
+    printf '┌%s┐\n' "$__hr_full"
+    _render_header_line
+    printf '├%s┤\n' "$__hr_full"
+
+    local i=0
+    while [[ $i -lt $N ]]; do
+        _build_row $i
+        local n=$_ncol
+
+        if [[ "$__mode" == "spark" ]]; then
+            _render_spark_row "$i"
+        else
+            _render_title_row
+            _render_bar_block
+            _render_footer
+        fi
+
+        i=$(( i + n ))
+    done
+
+    _render_status_line
+
+    # Count lines + clear leftovers from previous taller frame
+    local new_lines
+    if [[ "$__mode" == "spark" ]]; then
+        new_lines=$(( 4 + N ))
+    else
+        local metric_rows=$(( (N + __cols - 1) / __cols ))
+        new_lines=$(( 3 + metric_rows * (__barh + 2) + 1 ))
+    fi
+    if [[ ${__frame_lines:-0} -gt $new_lines ]]; then
+        local extra=$(( __frame_lines - new_lines ))
+        for ((ei=0; ei<extra; ei++)); do printf '\033[K\n'; done
+        printf '\033[%dA' "$extra"
+    fi
+    __frame_lines=$new_lines
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  DYNAMIC UPDATE  (same layout — redraw all mutable lines)
+# ═══════════════════════════════════════════════════════════════
+
+_render_update() {
+    printf '\033[%dA' "$__frame_lines"   # jump to top of previous frame
+
+    # Skip top border, redraw header
+    printf '\033[1B'
+    _render_header_line
+    printf '\033[1B'  # skip separator
+
+    if [[ "$__mode" == "spark" ]]; then
+        local i=0
+        while [[ $i -lt $N ]]; do
+            _render_spark_row "$i"
+            ((i++))
+        done
+    else
+        local i=0
+        while [[ $i -lt $N ]]; do
+            _build_row $i
+            local n=$_ncol
+
+            _render_title_row
+            _render_bar_block
+            _render_footer        # ← FIX: always redraw footer, not just skip
+
+            i=$(( i + n ))
+        done
+    fi
+
+    _render_status_line
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  DISPATCH  (buffered atomic output → zero flicker)
+# ═══════════════════════════════════════════════════════════════
+
+__RENDER_TMP="${TMPDIR:-/tmp}/pipechart-$$.buf"
+
+render() {
+    exec 3>&1
+    exec >"$__RENDER_TMP"
+
+    if _calc_layout; then
+        _render_full
+    else
+        _render_update
+    fi
+
+    exec >&3
+    exec 3>&-
+    cat "$__RENDER_TMP"
+}
+
+# ── Main ──
+main() {
+    parse_args "$@"
+    trap cleanup INT TERM EXIT
+    tput civis 2>/dev/null
+
+    echo "Discovering metrics..." >&2
+    local first_output; first_output=$(_collect)
+    discover_metrics "$first_output"
+    N=${#LABELS[@]}
+
+    # NOTE: leave COLS as 0 for _calc_layout auto-detection.
+    # Only override if user explicitly requested a value.
+    echo "Detected $N metric(s): ${LABELS[*]}" >&2
+
+    for ((i=0; i<N; i++)); do DATA+=(""); done
+    for ((i=0; i<N; i++)); do
+        local val; val=$(_extract "$first_output" "${AWKCODES[$i]}")
+        DATA[$i]="$val"
+    done
+
+    while true; do
+        t0=$EPOCHREALTIME
+
+        local output; output=$(_collect)
+
+        for ((i=0; i<N; i++)); do
+            local val; val=$(_extract "$output" "${AWKCODES[$i]}")
+            [[ -z "$val" ]] && val="0"
+            DATA[$i]="${DATA[$i]} $val"
+            local -a arr=(${DATA[$i]})
+            if [[ ${#arr[@]} -gt $HISTORY ]]; then
+                DATA[$i]="${arr[*]: -$HISTORY}"
+            fi
+        done
+
+        render
+
+        if ! $USE_STDIN; then
+            local now=$EPOCHREALTIME
+            local rem; rem=$(echo "$INTERVAL - ($now - $t0)" | bc -l 2>/dev/null || echo 0)
+            if (( $(echo "$rem > 0.01" | bc -l 2>/dev/null || echo 0) )); then
+                sleep "$rem"
+            fi
+        fi
+    done
+}
+
+main "$@"
